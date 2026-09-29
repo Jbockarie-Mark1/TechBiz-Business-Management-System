@@ -955,3 +955,203 @@ def change_password(request: Request, current_password: str = Form(...), new_pas
 @app.get("/health")
 def health():
     return {"status": "ok", "app": "TechBiz Business Management System", "version": "2.3"}
+
+# TEMPORARY DEPLOYMENT E2E SELF-TEST — removed immediately after verification.
+def _deployment_e2e_selftest():
+    from fastapi.testclient import TestClient
+    from sqlalchemy import delete as sa_delete
+    import traceback
+
+    marker = f"__E2E_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}_{secrets.token_hex(3)}"
+    username = marker.lower()
+    password = "E2E-Test-Only-2026!"
+    checks = []
+    ids = {}
+
+    def check(name, ok, detail=""):
+        checks.append({"name": name, "ok": bool(ok), "detail": str(detail)[:200]})
+        if not ok:
+            raise AssertionError(f"{name}: {detail}")
+
+    db = SessionLocal()
+    try:
+        business = db.scalar(select(Business).limit(1))
+        check("business_exists", business is not None)
+        test_user = User(
+            business_id=business.id,
+            username=username,
+            display_name="Deployment E2E Test",
+            password_hash=hash_password(password),
+            role="Owner",
+        )
+        db.add(test_user)
+        db.commit()
+        db.refresh(test_user)
+        ids["user"] = test_user.id
+        bid = business.id
+
+        with TestClient(app) as client:
+            r = client.get("/login")
+            check("login_page", r.status_code == 200, r.status_code)
+            r = client.post("/login", data={"username": username, "password": password}, follow_redirects=False)
+            check("login_auth", r.status_code == 303 and r.headers.get("location") == "/", f"{r.status_code} {r.headers.get('location')}")
+            r = client.get("/")
+            check("dashboard", r.status_code == 200, r.status_code)
+
+            r = client.post("/customers", data={
+                "name": f"{marker} Customer", "phone": "000", "email": "e2e@example.invalid",
+                "company": marker, "address": "E2E", "notes": marker
+            }, follow_redirects=False)
+            check("customer_create_route", r.status_code == 303, r.status_code)
+            db.expire_all()
+            customer = db.scalar(select(Customer).where(Customer.business_id == bid, Customer.company == marker))
+            check("customer_persisted", customer is not None)
+            ids["customer"] = customer.id
+
+            r = client.post("/inventory", data={
+                "name": f"{marker} Product", "sku": marker[-18:], "category": "E2E", "item_type": "product",
+                "unit": "unit", "cost_price": "5", "sale_price": "10", "stock_qty": "10", "min_stock": "2"
+            }, follow_redirects=False)
+            check("product_create_route", r.status_code == 303, r.status_code)
+            db.expire_all()
+            product = db.scalar(select(Product).where(Product.business_id == bid, Product.name == f"{marker} Product"))
+            check("product_opening_stock", product is not None and abs(product.stock_qty - 10) < 0.001, getattr(product, "stock_qty", None))
+            ids["product"] = product.id
+
+            items = json.dumps([{"product_id": product.id, "description": product.name, "qty": 2, "unit_price": 10}])
+            r = client.post("/sales/new", data={
+                "customer_id": str(customer.id), "payment_method": "Cash", "amount_paid": "8",
+                "notes": marker, "items_json": items
+            }, follow_redirects=False)
+            check("sale_create_route", r.status_code == 303 and str(r.headers.get("location", "")).startswith("/sales/"), f"{r.status_code} {r.headers.get('location')}")
+            sale_id = int(r.headers["location"].rsplit("/", 1)[1])
+            ids["sale"] = sale_id
+            db.expire_all()
+            sale = db.get(Sale, sale_id)
+            product = db.get(Product, product.id)
+            check("sale_part_paid", sale is not None and sale.status == "Part Paid" and abs(sale.amount_paid - 8) < 0.001, f"{getattr(sale,'status',None)} {getattr(sale,'amount_paid',None)}")
+            check("sale_stock_deducted", abs(product.stock_qty - 8) < 0.001, product.stock_qty)
+            r = client.get(f"/sales/{sale_id}")
+            check("receipt_page", r.status_code == 200, r.status_code)
+
+            r = client.post(f"/sales/{sale_id}/payment", data={
+                "amount": "12", "method": "Bank Transfer", "reference": marker, "payment_date": date.today().isoformat()
+            }, follow_redirects=False)
+            check("final_payment_route", r.status_code == 303, r.status_code)
+            db.expire_all()
+            sale = db.get(Sale, sale_id)
+            check("sale_paid", sale.status == "Paid" and abs(sale.amount_paid - 20) < 0.001, f"{sale.status} {sale.amount_paid}")
+
+            r = client.post("/suppliers", data={
+                "name": f"{marker} Supplier", "phone": "000", "email": "supplier@example.invalid", "address": "E2E", "notes": marker
+            }, follow_redirects=False)
+            check("supplier_create_route", r.status_code == 303, r.status_code)
+            db.expire_all()
+            supplier = db.scalar(select(Supplier).where(Supplier.business_id == bid, Supplier.name == f"{marker} Supplier"))
+            check("supplier_persisted", supplier is not None)
+            ids["supplier"] = supplier.id
+
+            purchase_items = json.dumps([{"product_id": product.id, "qty": 3, "unit_cost": 6}])
+            r = client.post("/purchases/new", data={
+                "supplier_id": str(supplier.id), "supplier_invoice": marker, "amount_paid": "18", "payment_method": "Cash",
+                "purchase_date": date.today().isoformat(), "notes": marker, "items_json": purchase_items
+            }, follow_redirects=False)
+            check("purchase_create_route", r.status_code == 303, r.status_code)
+            db.expire_all()
+            purchase = db.scalar(select(Purchase).where(Purchase.business_id == bid, Purchase.supplier_invoice == marker))
+            check("purchase_persisted", purchase is not None)
+            ids["purchase"] = purchase.id
+            product = db.get(Product, product.id)
+            check("purchase_stock_increase", abs(product.stock_qty - 11) < 0.001, product.stock_qty)
+            check("purchase_cost_update", abs(product.cost_price - 6) < 0.001, product.cost_price)
+
+            r = client.post("/jobs", data={
+                "customer_id": str(customer.id), "title": f"{marker} Print Job", "job_type": "Printing", "quantity": "50",
+                "size": "A4", "material": "Paper", "colour": "Full Colour", "sides": "Single-sided", "finishing": "Trim",
+                "design_required": "on", "total_amount": "50", "deposit": "10", "due_date": date.today().isoformat(), "notes": marker
+            }, follow_redirects=False)
+            check("job_create_route", r.status_code == 303, r.status_code)
+            db.expire_all()
+            job = db.scalar(select(PrintJob).where(PrintJob.business_id == bid, PrintJob.title == f"{marker} Print Job"))
+            check("job_persisted", job is not None and job.status == "New", getattr(job, "status", None))
+            ids["job"] = job.id
+            r = client.post(f"/jobs/{job.id}/status", data={"status": "Ready"}, follow_redirects=False)
+            check("job_status_route", r.status_code == 303, r.status_code)
+            db.expire_all()
+            job = db.get(PrintJob, job.id)
+            check("job_status_ready", job.status == "Ready", job.status)
+
+            r = client.post("/expenses", data={
+                "category": "E2E", "description": f"{marker} Expense", "amount": "7.5", "payment_method": "Cash",
+                "expense_date": date.today().isoformat()
+            }, follow_redirects=False)
+            check("expense_create_route", r.status_code == 303, r.status_code)
+            db.expire_all()
+            expense = db.scalar(select(Expense).where(Expense.business_id == bid, Expense.description == f"{marker} Expense"))
+            check("expense_persisted", expense is not None and abs(expense.amount - 7.5) < 0.001)
+            ids["expense"] = expense.id
+
+            for path, label in [("/customers", "customers_page"), ("/inventory", "inventory_page"), ("/sales", "sales_page"),
+                                ("/suppliers", "suppliers_page"), ("/jobs", "jobs_page"), ("/expenses", "expenses_page"),
+                                ("/cashbook", "cashbook_page"), ("/reports", "reports_page"), ("/users", "users_page")]:
+                r = client.get(path)
+                check(label, r.status_code == 200, r.status_code)
+
+            r = client.get("/reports/sales.csv")
+            check("sales_csv", r.status_code == 200 and "text/csv" in r.headers.get("content-type", ""), f"{r.status_code} {r.headers.get('content-type')}")
+            r = client.get("/settings")
+            settings_html = r.text
+            check("settings_page", r.status_code == 200, r.status_code)
+            check("branding_controls", all(x in settings_html for x in ['name="logo"', 'name="theme_primary"', 'name="theme_sidebar"', 'name="theme_background"']), "branding fields")
+            check("jits_footer", "Power by Jits" in settings_html and "Smart Technology. Reliable Solutions" in settings_html)
+            r = client.get("/health")
+            check("health_v23", r.status_code == 200 and r.json().get("version") == "2.3", r.text[:100])
+            r = client.get("/logout", follow_redirects=False)
+            check("logout", r.status_code == 303 and r.headers.get("location") == "/login", f"{r.status_code} {r.headers.get('location')}")
+            r = client.get("/", follow_redirects=False)
+            check("auth_required_after_logout", r.status_code == 303 and r.headers.get("location") == "/login", f"{r.status_code} {r.headers.get('location')}")
+
+        db.expire_all()
+        check("neon_persistence_sale", db.get(Sale, ids["sale"]) is not None)
+        check("neon_persistence_product", db.get(Product, ids["product"]) is not None)
+        print("TECHBIZ_E2E_RESULT " + json.dumps({"ok": True, "checks": len(checks), "marker": marker}))
+
+    except Exception as exc:
+        print("TECHBIZ_E2E_RESULT " + json.dumps({"ok": False, "checks": checks, "marker": marker, "error": repr(exc)}))
+        traceback.print_exc()
+    finally:
+        try:
+            db.rollback()
+            if ids.get("product"):
+                db.execute(sa_delete(StockMovement).where(StockMovement.product_id == ids["product"]))
+            if ids.get("sale"):
+                db.execute(sa_delete(Payment).where(Payment.sale_id == ids["sale"]))
+                db.execute(sa_delete(SaleItem).where(SaleItem.sale_id == ids["sale"]))
+                db.execute(sa_delete(Sale).where(Sale.id == ids["sale"]))
+            if ids.get("purchase"):
+                db.execute(sa_delete(PurchaseItem).where(PurchaseItem.purchase_id == ids["purchase"]))
+                db.execute(sa_delete(Purchase).where(Purchase.id == ids["purchase"]))
+            if ids.get("job"):
+                db.execute(sa_delete(PrintJob).where(PrintJob.id == ids["job"]))
+            if ids.get("expense"):
+                db.execute(sa_delete(Expense).where(Expense.id == ids["expense"]))
+            if ids.get("supplier"):
+                db.execute(sa_delete(Supplier).where(Supplier.id == ids["supplier"]))
+            if ids.get("product"):
+                db.execute(sa_delete(Product).where(Product.id == ids["product"]))
+            if ids.get("customer"):
+                db.execute(sa_delete(Customer).where(Customer.id == ids["customer"]))
+            if ids.get("user"):
+                db.execute(sa_delete(AuditLog).where(AuditLog.user_id == ids["user"]))
+                db.execute(sa_delete(User).where(User.id == ids["user"]))
+            db.commit()
+            print("TECHBIZ_E2E_CLEANUP " + json.dumps({"ok": True, "marker": marker}))
+        except Exception as cleanup_exc:
+            db.rollback()
+            print("TECHBIZ_E2E_CLEANUP " + json.dumps({"ok": False, "marker": marker, "error": repr(cleanup_exc)}))
+        finally:
+            db.close()
+
+
+if os.getenv("TECHBIZ_TEMP_DEPLOY_E2E") == "1":
+    _deployment_e2e_selftest()
