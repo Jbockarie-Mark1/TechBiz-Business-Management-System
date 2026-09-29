@@ -1,1 +1,72 @@
-{% extends 'base.html' %}{% block page_title %}Business Settings{% endblock %}{% block content %}{% if request.query_params.get('saved') %}<div class="alert alert-success">Business settings saved.</div>{% endif %}{% if request.query_params.get('password_saved') %}<div class="alert alert-success">Password changed successfully.</div>{% endif %}{% if request.query_params.get('password_error') %}<div class="alert alert-danger">Current password was incorrect, or the new password is shorter than 8 characters.</div>{% endif %}<div class="grid panel-grid"><div class="card"><h3 class="section-title">Business profile & branding</h3><div class="section-sub">This is what makes the same system reusable for other businesses.</div><form method="post" style="margin-top:16px"><div class="form-grid"><div class="field full"><label>Business name</label><input name="name" required value="{{ business.name }}"></div><div class="field full"><label>Business type</label><input name="business_type" required value="{{ business.business_type }}" placeholder="Printing, retail, pharmacy, services..."></div><div class="field"><label>Currency</label><input name="currency" value="{{ business.currency }}"></div><div class="field"><label>Primary colour</label><input name="theme_primary" type="color" value="{{ business.theme_primary }}"></div><div class="field"><label>Phone</label><input name="phone" value="{{ business.phone }}"></div><div class="field"><label>Email</label><input name="email" type="email" value="{{ business.email }}"></div><div class="field full"><label>Address</label><input name="address" value="{{ business.address }}"></div><div class="field full"><label>Receipt footer</label><input name="receipt_footer" value="{{ business.receipt_footer }}"></div><div class="field full"><label>Enabled modules</label><div class="modules">{% for key,label in [('sales','Sales'),('customers','Customers'),('jobs','Production Jobs'),('inventory','Inventory'),('suppliers','Suppliers & Purchases'),('expenses','Expenses & Cashbook'),('reports','Reports')] %}<label class="check"><input type="checkbox" name="modules" value="{{ key }}" {% if key in modules %}checked{% endif %}> {{ label }}</label>{% endfor %}</div></div></div><button class="btn btn-primary" style="margin-top:14px">Save settings</button></form></div><div class="stack"><div class="card"><h3 class="section-title">Change your password</h3><form method="post" action="/settings/password" style="margin-top:14px"><div class="field"><label>Current password</label><input name="current_password" type="password" required></div><div class="field" style="margin-top:10px"><label>New password</label><input name="new_password" type="password" minlength="8" required></div><button class="btn btn-dark" style="margin-top:14px">Change password</button></form></div><div class="card"><h3 class="section-title">Commercial-ready foundation</h3><p class="muted">All operational records are separated by a business/tenant ID. The same codebase can therefore be extended to host different companies with separate branding, users and data.</p><div class="stat-line"><span>Default currency</span><strong>{{ business.currency }}</strong></div><div class="stat-line"><span>Business type</span><strong>{{ business.business_type }}</strong></div><div class="stat-line"><span>Enabled modules</span><strong>{{ modules|length }}</strong></div></div></div></div>{% endblock %}
+{% extends 'base.html' %}
+{% block page_title %}Business Settings{% endblock %}
+{% block content %}
+{% if request.query_params.get('saved') %}<div class="alert alert-success">Business settings and branding saved.</div>{% endif %}
+{% if request.query_params.get('logo_error') %}<div class="alert alert-danger">Logo upload failed. Use a valid PNG, JPG, WEBP or GIF image no larger than 2 MB.</div>{% endif %}
+{% if request.query_params.get('password_saved') %}<div class="alert alert-success">Password changed successfully.</div>{% endif %}
+{% if request.query_params.get('password_error') %}<div class="alert alert-danger">Current password was incorrect, or the new password is shorter than 8 characters.</div>{% endif %}
+<div class="grid panel-grid">
+  <div class="card">
+    <h3 class="section-title">Business profile & branding</h3>
+    <div class="section-sub">Upload your logo and choose the colours that identify this business.</div>
+    <form method="post" enctype="multipart/form-data" style="margin-top:16px">
+      <div class="branding-preview" id="brandingPreview">
+        <div class="branding-preview-sidebar" id="previewSidebar">
+          {% if business.logo_path %}<img id="previewLogo" class="business-logo preview-logo" src="{{ business.logo_path }}" alt="Current business logo">{% else %}<div id="previewFallback" class="brand-badge">{{ business.name[:1]|upper }}</div><img id="previewLogo" class="business-logo preview-logo" src="" alt="Logo preview" style="display:none">{% endif %}
+          <div><strong id="previewName">{{ business.name }}</strong><div class="preview-type">{{ business.business_type }}</div></div>
+        </div>
+        <div class="branding-preview-main" id="previewMain"><span class="preview-button" id="previewButton">Primary action</span><span class="muted tiny">Live theme preview</span></div>
+      </div>
+      <div class="form-grid">
+        <div class="field full"><label>Business name</label><input id="businessName" name="name" required value="{{ business.name }}"></div>
+        <div class="field full"><label>Business type</label><input name="business_type" required value="{{ business.business_type }}" placeholder="Printing, retail, pharmacy, services..."></div>
+        <div class="field full"><label>Business logo</label><input id="logoInput" name="logo" type="file" accept="image/png,image/jpeg,image/webp,image/gif"><div class="muted tiny">PNG, JPG, WEBP or GIF. Maximum upload size: 2 MB. The system automatically resizes the logo to fit the default branding area while preserving its proportions and transparency.</div>{% if business.logo_path %}<label class="check logo-remove"><input type="checkbox" name="remove_logo" value="1"> Remove current logo</label>{% endif %}</div>
+        <div class="field"><label>Primary / accent colour</label><input id="themePrimary" name="theme_primary" type="color" value="{{ business.theme_primary or '#c8102e' }}"></div>
+        <div class="field"><label>Sidebar colour</label><input id="themeSidebar" name="theme_sidebar" type="color" value="{{ business.theme_sidebar or '#111827' }}"></div>
+        <div class="field"><label>Page background colour</label><input id="themeBackground" name="theme_background" type="color" value="{{ business.theme_background or '#f5f7fb' }}"></div>
+        <div class="field"><label>Currency</label><input name="currency" value="{{ business.currency }}"></div>
+        <div class="field"><label>Phone</label><input name="phone" value="{{ business.phone }}"></div>
+        <div class="field"><label>Email</label><input name="email" type="email" value="{{ business.email }}"></div>
+        <div class="field full"><label>Address</label><input name="address" value="{{ business.address }}"></div>
+        <div class="field full"><label>Receipt footer</label><input name="receipt_footer" value="{{ business.receipt_footer }}"></div>
+        <div class="field full"><label>Enabled modules</label><div class="modules">{% for key,label in [('sales','Sales'),('customers','Customers'),('jobs','Production Jobs'),('inventory','Inventory'),('suppliers','Suppliers & Purchases'),('expenses','Expenses & Cashbook'),('reports','Reports')] %}<label class="check"><input type="checkbox" name="modules" value="{{ key }}" {% if key in modules %}checked{% endif %}> {{ label }}</label>{% endfor %}</div></div>
+      </div>
+      <button class="btn btn-primary" style="margin-top:14px">Save business branding & settings</button>
+    </form>
+  </div>
+  <div class="stack">
+    <div class="card"><h3 class="section-title">Change your password</h3><form method="post" action="/settings/password" style="margin-top:14px"><div class="field"><label>Current password</label><input name="current_password" type="password" required></div><div class="field" style="margin-top:10px"><label>New password</label><input name="new_password" type="password" minlength="8" required></div><button class="btn btn-dark" style="margin-top:14px">Change password</button></form></div>
+    <div class="card"><h3 class="section-title">Reusable business identity</h3><p class="muted">Logo and theme settings belong to the business profile. This keeps the system ready for different companies to have their own identity while using the same application.</p><div class="stat-line"><span>Default currency</span><strong>{{ business.currency }}</strong></div><div class="stat-line"><span>Business type</span><strong>{{ business.business_type }}</strong></div><div class="stat-line"><span>Custom logo</span><strong>{{ 'Yes' if business.logo_path else 'Not uploaded' }}</strong></div><div class="stat-line"><span>Enabled modules</span><strong>{{ modules|length }}</strong></div></div>
+  </div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+(function(){
+  const primary=document.getElementById('themePrimary');
+  const sidebar=document.getElementById('themeSidebar');
+  const background=document.getElementById('themeBackground');
+  const previewSidebar=document.getElementById('previewSidebar');
+  const previewMain=document.getElementById('previewMain');
+  const previewButton=document.getElementById('previewButton');
+  const nameInput=document.getElementById('businessName');
+  const previewName=document.getElementById('previewName');
+  const logoInput=document.getElementById('logoInput');
+  const previewLogo=document.getElementById('previewLogo');
+  const previewFallback=document.getElementById('previewFallback');
+  function refresh(){
+    previewSidebar.style.background=sidebar.value;
+    previewMain.style.background=background.value;
+    previewButton.style.background=primary.value;
+    previewName.textContent=nameInput.value || 'Your Business';
+    if(previewFallback) previewFallback.style.background=primary.value;
+  }
+  [primary,sidebar,background,nameInput].forEach(el=>el && el.addEventListener('input',refresh));
+  if(logoInput){logoInput.addEventListener('change',function(){
+    const file=this.files && this.files[0]; if(!file) return;
+    const reader=new FileReader(); reader.onload=e=>{previewLogo.src=e.target.result;previewLogo.style.display='block';if(previewFallback) previewFallback.style.display='none';};reader.readAsDataURL(file);
+  });}
+  refresh();
+})();
+</script>
+{% endblock %}

@@ -15,3 +15,5 @@ env/
 .vscode/
 *.sqlite
 *.sqlite3
+static/uploads/*
+!static/uploads/.gitkeep

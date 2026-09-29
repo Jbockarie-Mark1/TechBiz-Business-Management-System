@@ -3,15 +3,18 @@ import hashlib
 import io
 import json
 import os
+import re
 import secrets
+from io import BytesIO
+from PIL import Image, ImageOps, UnidentifiedImageError
 from datetime import date, datetime
 from typing import Optional
 
-from fastapi import Depends, FastAPI, Form, HTTPException, Request
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, create_engine, func, select
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, create_engine, func, inspect, select, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 from starlette.middleware.sessions import SessionMiddleware
 
@@ -37,6 +40,9 @@ class Business(Base):
     address: Mapped[str] = mapped_column(String(255), default="Freetown, Sierra Leone")
     receipt_footer: Mapped[str] = mapped_column(String(255), default="Thank you for your business.")
     theme_primary: Mapped[str] = mapped_column(String(20), default="#c8102e")
+    theme_sidebar: Mapped[str] = mapped_column(String(20), default="#111827")
+    theme_background: Mapped[str] = mapped_column(String(20), default="#f5f7fb")
+    logo_path: Mapped[str] = mapped_column(String(255), default="")
     modules_json: Mapped[str] = mapped_column(Text, default='["sales","customers","jobs","inventory","suppliers","expenses","reports"]')
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
@@ -232,6 +238,23 @@ class AuditLog(Base):
 Base.metadata.create_all(engine)
 
 
+def ensure_business_branding_columns() -> None:
+    """Small compatibility migration for databases created by TechBiz v2.1 or earlier."""
+    existing = {c["name"] for c in inspect(engine).get_columns("businesses")}
+    additions = {
+        "theme_sidebar": "VARCHAR(20) DEFAULT '#111827'",
+        "theme_background": "VARCHAR(20) DEFAULT '#f5f7fb'",
+        "logo_path": "VARCHAR(255) DEFAULT ''",
+    }
+    with engine.begin() as conn:
+        for column, definition in additions.items():
+            if column not in existing:
+                conn.execute(text(f"ALTER TABLE businesses ADD COLUMN {column} {definition}"))
+
+
+ensure_business_branding_columns()
+
+
 def hash_password(password: str) -> str:
     salt = secrets.token_hex(16)
     dk = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 180000)
@@ -285,7 +308,7 @@ def seed() -> None:
 
 seed()
 
-app = FastAPI(title="TechBiz Business Management System", version="2.0")
+app = FastAPI(title="TechBiz Business Management System", version="2.3")
 app.add_middleware(SessionMiddleware, secret_key=os.getenv("SESSION_SECRET", "local-dev-secret-change-before-hosting"), same_site="lax")
 app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
 templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
@@ -299,6 +322,52 @@ def money(v) -> str:
 
 
 templates.env.filters["money"] = money
+
+
+COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+ALLOWED_LOGO_TYPES = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+}
+MAX_LOGO_BYTES = 2 * 1024 * 1024
+LOGO_MAX_DIMENSION = 512
+LOGO_MAX_PIXELS = 24_000_000
+UPLOAD_DIR = os.path.join(BASE_DIR, "static", "uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+
+def safe_color(value: str, fallback: str) -> str:
+    value = (value or "").strip()
+    return value if COLOR_RE.fullmatch(value) else fallback
+
+
+def normalize_logo(data: bytes, content_type: str) -> bytes:
+    """Validate and resize a business logo to a safe, system-friendly PNG.
+
+    The longest side is capped at LOGO_MAX_DIMENSION while preserving the
+    original aspect ratio. Transparency is preserved where available.
+    """
+    if content_type not in ALLOWED_LOGO_TYPES:
+        raise ValueError("Unsupported logo type")
+    try:
+        with Image.open(BytesIO(data)) as probe:
+            probe.verify()
+        with Image.open(BytesIO(data)) as image:
+            image = ImageOps.exif_transpose(image)
+            width, height = image.size
+            if width < 1 or height < 1 or width * height > LOGO_MAX_PIXELS:
+                raise ValueError("Invalid logo dimensions")
+            if getattr(image, "is_animated", False):
+                image.seek(0)
+            image = image.convert("RGBA")
+            image.thumbnail((LOGO_MAX_DIMENSION, LOGO_MAX_DIMENSION), Image.Resampling.LANCZOS)
+            output = BytesIO()
+            image.save(output, format="PNG", optimize=True)
+            return output.getvalue()
+    except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError) as exc:
+        raise ValueError("Invalid logo image") from exc
 
 
 def get_db():
@@ -362,14 +431,16 @@ async def unauthorized(request: Request, exc):
 def login_page(request: Request, db: Session = Depends(get_db)):
     if current_user(request, db):
         return RedirectResponse("/", status_code=303)
-    return templates.TemplateResponse(request, "login.html", {"error": None})
+    business = db.scalar(select(Business).limit(1))
+    return templates.TemplateResponse(request, "login.html", {"request": request, "error": None, "business": business, "user": None})
 
 
 @app.post("/login", response_class=HTMLResponse)
 def login(request: Request, username: str = Form(...), password: str = Form(...), db: Session = Depends(get_db)):
     user = db.scalar(select(User).where(User.username == username, User.active == True))
     if not user or not verify_password(password, user.password_hash):
-        return templates.TemplateResponse(request, "login.html", {"error": "Invalid username or password."})
+        business = db.scalar(select(Business).limit(1))
+        return templates.TemplateResponse(request, "login.html", {"request": request, "error": "Invalid username or password.", "business": business, "user": None})
     request.session["user_id"] = user.id
     log_action(db, user, "login", "Signed in")
     db.commit()
@@ -808,7 +879,23 @@ def settings(request: Request, db: Session = Depends(get_db)):
 
 
 @app.post("/settings")
-def save_settings(request: Request, name: str = Form(...), business_type: str = Form(...), currency: str = Form("SLE"), phone: str = Form(""), email: str = Form(""), address: str = Form(""), receipt_footer: str = Form(""), theme_primary: str = Form("#c8102e"), modules: list[str] = Form([]), db: Session = Depends(get_db)):
+def save_settings(
+    request: Request,
+    name: str = Form(...),
+    business_type: str = Form(...),
+    currency: str = Form("SLE"),
+    phone: str = Form(""),
+    email: str = Form(""),
+    address: str = Form(""),
+    receipt_footer: str = Form(""),
+    theme_primary: str = Form("#c8102e"),
+    theme_sidebar: str = Form("#111827"),
+    theme_background: str = Form("#f5f7fb"),
+    remove_logo: Optional[str] = Form(None),
+    logo: Optional[UploadFile] = File(None),
+    modules: list[str] = Form([]),
+    db: Session = Depends(get_db),
+):
     user = require_user(request, db)
     if user.role not in {"Owner", "Admin", "Manager"}:
         raise HTTPException(403)
@@ -820,9 +907,36 @@ def save_settings(request: Request, name: str = Form(...), business_type: str = 
     b.email = email.strip()
     b.address = address.strip()
     b.receipt_footer = receipt_footer.strip()
-    b.theme_primary = theme_primary.strip() or "#c8102e"
+    b.theme_primary = safe_color(theme_primary, "#c8102e")
+    b.theme_sidebar = safe_color(theme_sidebar, "#111827")
+    b.theme_background = safe_color(theme_background, "#f5f7fb")
     b.modules_json = json.dumps(modules or ["sales", "customers", "inventory", "reports"])
-    log_action(db, user, "settings.update", "Business settings updated")
+
+    new_logo_data = None
+    if logo and logo.filename:
+        content_type = (logo.content_type or "").lower()
+        raw_logo_data = logo.file.read(MAX_LOGO_BYTES + 1)
+        if len(raw_logo_data) > MAX_LOGO_BYTES:
+            return RedirectResponse("/settings?logo_error=1", status_code=303)
+        try:
+            new_logo_data = normalize_logo(raw_logo_data, content_type)
+        except ValueError:
+            return RedirectResponse("/settings?logo_error=1", status_code=303)
+
+    if (remove_logo or new_logo_data is not None) and b.logo_path:
+        old_name = os.path.basename(b.logo_path)
+        old_file = os.path.join(UPLOAD_DIR, old_name)
+        if os.path.isfile(old_file):
+            os.remove(old_file)
+        b.logo_path = ""
+
+    if new_logo_data is not None:
+        filename = f"business_{b.id}_{secrets.token_hex(6)}.png"
+        with open(os.path.join(UPLOAD_DIR, filename), "wb") as output:
+            output.write(new_logo_data)
+        b.logo_path = f"/static/uploads/{filename}"
+
+    log_action(db, user, "settings.update", "Business profile, logo and theme updated")
     db.commit()
     return RedirectResponse("/settings?saved=1", status_code=303)
 
@@ -840,4 +954,4 @@ def change_password(request: Request, current_password: str = Form(...), new_pas
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "app": "TechBiz Business Management System", "version": "2.0"}
+    return {"status": "ok", "app": "TechBiz Business Management System", "version": "2.3"}
